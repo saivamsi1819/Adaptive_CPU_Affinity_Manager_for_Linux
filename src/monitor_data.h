@@ -65,6 +65,7 @@ typedef struct {
 typedef struct {
     pid_t pid; /* Thread-group/process ID. */
     pid_t tid; /* Linux task ID; affinity operations target a task/TID. */
+    int last_cpu; /* Last CPU reported by /proc/<pid>/task/<tid>/stat; -1 if unknown. */
     char name[MONITOR_NAME_MAX];
     unsigned long long start_ticks;
     unsigned long long cpu_time_ticks; /* utime + stime */

@@ -54,7 +54,7 @@ static int parse_positive_id(const char *text, pid_t *out)
 
 static int parse_stat_file(const char *path, char *name, size_t name_size,
                            unsigned long long *ticks,
-                           unsigned long long *start_ticks)
+                           unsigned long long *start_ticks, int *last_cpu)
 {
     char line[PROC_LINE_SIZE];
     FILE *fp = fopen(path, "r");
@@ -77,19 +77,21 @@ static int parse_stat_file(const char *path, char *name, size_t name_size,
     name[n] = '\0';
 
     unsigned long long utime = 0, stime = 0, start = 0;
-    int got_u = 0, got_s = 0, got_start = 0;
+    int got_u = 0, got_s = 0, got_start = 0, got_cpu = 0;
+    int processor = -1;
     char *save = NULL;
     char *token = strtok_r(right + 1, " \t\n", &save);
     int index = 0;
     while (token) {
-        if (index == 11 || index == 12 || index == 19) {
+        if (index == 11 || index == 12 || index == 19 || index == 36) {
             errno = 0;
             char *end = NULL;
             unsigned long long v = strtoull(token, &end, 10);
             if (errno || end == token || *end) return -1;
             if (index == 11) { utime = v; got_u = 1; }
             else if (index == 12) { stime = v; got_s = 1; }
-            else { start = v; got_start = 1; }
+            else if (index == 19) { start = v; got_start = 1; }
+            else if (v <= INT_MAX) { processor = (int)v; got_cpu = 1; }
         }
         ++index;
         token = strtok_r(NULL, " \t\n", &save);
@@ -98,6 +100,7 @@ static int parse_stat_file(const char *path, char *name, size_t name_size,
         return -1;
     *ticks = utime + stime;
     *start_ticks = start;
+    if (last_cpu != NULL) *last_cpu = got_cpu ? processor : -1;
     return 0;
 }
 
@@ -241,9 +244,10 @@ static MonitorStatus collect_tasks(const MonitorSnapshot *previous,
         if (!threads) {
             char path[128], name[MONITOR_NAME_MAX];
             unsigned long long ticks, start;
+            int last_cpu = -1;
             int n = snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
             if (n < 0 || (size_t)n >= sizeof(path) ||
-                parse_stat_file(path, name, sizeof(name), &ticks, &start) != 0) {
+                parse_stat_file(path, name, sizeof(name), &ticks, &start, &last_cpu) != 0) {
                 partial = 1; continue;
             }
             ProcessSample item = {0};
@@ -275,13 +279,15 @@ static MonitorStatus collect_tasks(const MonitorSnapshot *previous,
                 if (parse_positive_id(te->d_name, &tid) != 0) continue;
                 char path[160], name[MONITOR_NAME_MAX];
                 unsigned long long ticks, start;
+                int last_cpu = -1;
                 n = snprintf(path, sizeof(path), "/proc/%ld/task/%ld/stat", (long)pid, (long)tid);
                 if (n < 0 || (size_t)n >= sizeof(path) ||
-                    parse_stat_file(path, name, sizeof(name), &ticks, &start) != 0) {
+                    parse_stat_file(path, name, sizeof(name), &ticks, &start, &last_cpu) != 0) {
                     partial = 1; continue;
                 }
                 ThreadSample item = {0};
                 item.pid = pid; item.tid = tid; item.start_ticks = start;
+                item.last_cpu = last_cpu;
                 item.cpu_time_ticks = ticks;
                 snprintf(item.name, sizeof(item.name), "%s", name);
                 if (previous) {
