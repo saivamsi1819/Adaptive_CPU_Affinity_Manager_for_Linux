@@ -9,10 +9,13 @@ extern "C" {
 
 /*
  * Heuristic policy for evaluating a proposed single-thread affinity move.
- * All cost/benefit values are expressed in percentage points of CPU imbalance.
- * These are tunable model parameters, not measured physical cache-miss costs.
+ * When the selector supplies a system-wide projection, benefit is the reduction
+ * in population standard deviation of per-CPU utilization, in percentage
+ * points. Cost parameters are tunable policy weights, not measured cache
+ * costs. The locality weight is scaled by the selected topology score;
+ * unknown topology receives the full locality weight.
  */
-typedef struct {
+typedef struct BenefitCostPolicyConfig {
     double base_migration_cost_percent_points;
     double locality_cost_percent_points;
     double minimum_expected_benefit_percent_points;
@@ -42,10 +45,9 @@ BenefitCostPolicyConfig benefit_cost_policy_default_config(void);
 /*
  * Estimate whether a candidate move is worthwhile. This function is pure:
  * it does not inspect or change affinity and never calls sched_setaffinity().
- * The simple projection assumes the candidate's measured thread utilization
- * can be removed from source and added to destination. Since /proc's last_cpu
- * is not a per-CPU execution history, this is a heuristic and must be validated
- * experimentally. A controller must independently revalidate task identity,
+ * It prefers the selector's system-wide projection. If that estimate is absent,
+ * it uses a compatibility pairwise fallback. All estimates are heuristics:
+ * /proc's last_cpu is not a per-CPU execution history. Revalidate task identity,
  * affinity, and safety immediately before any eventual action.
  */
 BenefitCostDecision benefit_cost_evaluate(

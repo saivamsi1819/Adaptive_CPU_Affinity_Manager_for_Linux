@@ -56,6 +56,57 @@ int main(void)
     ok &= expect("score is benefit minus cost",
                  fabs(result.score_percent_points - 40.0) < 1e-9);
 
+    /* The whole-system projection must take precedence over the old pairwise
+     * fallback. This represents [100,100,0,0] -> [50,100,50,0]: max-min
+     * remains 100pp, but population standard deviation falls from 50 to
+     * sqrt(1250), so the move is meaningfully beneficial. */
+    summary = make_summary(0.0, 100.0);
+    candidate = make_candidate(50.0);
+    candidate.system_imbalance_estimate_valid = 1;
+    candidate.estimated_system_imbalance_before_percent_points = 50.0;
+    candidate.estimated_system_imbalance_after_percent_points = sqrt(1250.0);
+    ok &= expect("system-wide spread reduction is approved",
+                 benefit_cost_evaluate(&summary, &candidate, &config, &result) ==
+                 BENEFIT_COST_APPROVE);
+    ok &= expect("system-wide estimate is used for benefit",
+                 fabs(result.estimated_benefit_percent_points -
+                      (50.0 - sqrt(1250.0))) < 1e-9);
+
+    /* A 9pp projected benefit clears the 5pp minimum. Same-L3 locality
+       scales the locality cost enough to approve; a remote domain does not. */
+    candidate.system_imbalance_estimate_valid = 1;
+    candidate.estimated_system_imbalance_before_percent_points =
+        sqrt(10000.0 / 12.0 - (100.0 / 12.0) * (100.0 / 12.0));
+    candidate.estimated_system_imbalance_after_percent_points =
+        sqrt(5000.0 / 12.0 - (100.0 / 12.0) * (100.0 / 12.0));
+    candidate.locality_score = LOCALITY_SCORE_SAME_L3;
+    ok &= expect("same-L3 locality scales the migration cost",
+                 benefit_cost_evaluate(&summary, &candidate, &config, &result) ==
+                     BENEFIT_COST_APPROVE &&
+                 fabs(result.estimated_migration_cost_percent_points - 8.75) <
+                     1e-9);
+    candidate.locality_score = LOCALITY_SCORE_DIFFERENT_DOMAIN;
+    ok &= expect("different locality domain receives the larger penalty",
+                 benefit_cost_evaluate(&summary, &candidate, &config, &result) ==
+                     BENEFIT_COST_REJECT_COST &&
+                 fabs(result.estimated_migration_cost_percent_points - 15.0) <
+                     1e-9);
+
+    candidate.estimated_system_imbalance_before_percent_points = 50.0;
+    candidate.estimated_system_imbalance_after_percent_points = 50.0;
+    ok &= expect("zero system-wide improvement is rejected even if pairwise fallback looks good",
+                 benefit_cost_evaluate(&summary, &candidate, &config, &result) ==
+                 BENEFIT_COST_REJECT_LOW_BENEFIT);
+
+    candidate = make_candidate(50.0);
+    candidate.system_imbalance_estimate_valid = 1;
+    candidate.estimated_system_imbalance_before_percent_points = 50.0;
+    candidate.estimated_system_imbalance_after_percent_points = NAN;
+    ok &= expect("non-finite system-wide estimate rejected",
+                 benefit_cost_evaluate(&summary, &candidate, &config, &result) ==
+                 BENEFIT_COST_REJECT_INVALID);
+
+    summary = make_summary(20.0, 80.0);
     candidate = make_candidate(2.0);
     ok &= expect("small projected benefit rejected",
                  benefit_cost_evaluate(&summary, &candidate, &config, &result) ==

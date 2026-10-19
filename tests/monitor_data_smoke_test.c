@@ -6,6 +6,20 @@
 
 int main(void)
 {
+    double normalized_usage = -1.0;
+    if (monitor_compute_thread_utilization(51, 0.5, 100,
+                                           &normalized_usage) != 0 ||
+        normalized_usage != 100.0) {
+        fprintf(stderr, "One-tick utilization overshoot was not normalized.\n");
+        return 1;
+    }
+    if (monitor_compute_thread_utilization(52, 0.5, 100,
+                                           &normalized_usage) == 0) {
+        fprintf(stderr, "Impossible utilization overshoot was accepted.\n");
+        return 1;
+    }
+    puts("PASS: thread-utilization tick-quantization handling");
+
     MonitorSnapshot previous, current;
     monitor_snapshot_init(&previous);
     monitor_snapshot_init(&current);

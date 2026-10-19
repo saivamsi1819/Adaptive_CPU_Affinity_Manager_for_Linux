@@ -1,7 +1,10 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #ifndef LOCALITY_POLICY_H
 #define LOCALITY_POLICY_H
 
-/* Userspace cache-locality preference scoring. Never changes affinity. */
 #include <sched.h>
 #include <stddef.h>
 
@@ -34,17 +37,20 @@ typedef enum {
 
 void locality_topology_init(LocalityTopology *topology);
 
-/* Pass NULL for the default /sys/devices/system/cpu root. */
-LocalityStatus locality_topology_discover(LocalityTopology *topology,
-                                         const char *sysfs_cpu_root);
+/* Pass NULL to use /sys/devices/system/cpu. */
+LocalityStatus locality_topology_discover(
+    LocalityTopology *topology,
+    const char *sysfs_cpu_root);
 
-/* Destination must already be in allowed_cpus; this function never widens it. */
-LocalityScore locality_score_destination(const LocalityTopology *topology,
-                                         int source_cpu,
-                                         int destination_cpu,
-                                         const cpu_set_t *allowed_cpus);
+/* Destination must be in allowed_cpus; affinity is never widened. */
+LocalityScore locality_score_destination(
+    const LocalityTopology *topology,
+    int source_cpu,
+    int destination_cpu,
+    const cpu_set_t *allowed_cpus);
 
 #ifdef __cplusplus
 }
 #endif
-#endif
+
+#endif /* LOCALITY_POLICY_H */
