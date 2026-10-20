@@ -1,0 +1,1 @@
+A good way to find out is to compare the current policy with a no-locality variant in **dry-run mode**, using the same workloads and recording how often each approves a move and its projected benefit. That would show whether it changes decisions; proving performance improvement would still require later controlled runs on native Linux.

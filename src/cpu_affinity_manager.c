@@ -8,6 +8,7 @@
 #include "candidate_selector.h"
 #include "benefit_cost_policy.h"
 #include "locality_policy.h"
+#include "affinity_lease_guardian.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -22,8 +23,13 @@
 #define DEFAULT_INTERVAL_MS 1000
 #define ACTION_COOLDOWN_SECONDS 10.0
 #define MAX_ACTIONS_PER_MINUTE 6
+#define AFFINITY_LEASE_SECONDS 5.0
+#define MAX_AFFINITY_LEASES AFFINITY_LEASE_CAPACITY
 
 static volatile sig_atomic_t keep_running = 1;
+
+static int read_task_start_ticks(pid_t pid, pid_t tid,
+                                 unsigned long long *start_ticks);
 
 /* Stop the main loop safely when Ctrl+C or SIGTERM is received. */
 static void handle_signal(int signo)
@@ -37,6 +43,116 @@ static double timespec_diff_seconds(struct timespec a, struct timespec b)
 {
     return (double)(a.tv_sec - b.tv_sec) +
            (double)(a.tv_nsec - b.tv_nsec) / 1e9;
+}
+
+static int task_identity_is_owned(pid_t pid, pid_t tid,
+                                  unsigned long long expected_start_ticks)
+{
+    unsigned long long current_start_ticks = 0;
+    if (read_task_start_ticks(pid, tid, &current_start_ticks) != 0)
+        return -1;
+    if (current_start_ticks != expected_start_ticks) {
+        errno = ESRCH;
+        return 0;
+    }
+
+    char task_path[128];
+    int path_length = snprintf(task_path, sizeof(task_path),
+                               "/proc/%ld/task/%ld", (long)pid, (long)tid);
+    if (path_length < 0 || (size_t)path_length >= sizeof(task_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    struct stat task_info;
+    if (stat(task_path, &task_info) != 0)
+        return -1;
+    if (task_info.st_uid != geteuid()) {
+        errno = EPERM;
+        return 0;
+    }
+    return 1;
+}
+
+static int affinity_masks_equal(const cpu_set_t *left, const cpu_set_t *right)
+{
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, left) != CPU_ISSET(cpu, right))
+            return 0;
+    }
+    return 1;
+}
+
+static void restore_affinity_lease(AffinityLease *lease, const char *reason)
+{
+    if (lease == NULL || !lease->active)
+        return;
+
+    if (task_identity_is_owned(lease->pid, lease->tid,
+                               lease->start_ticks) != 1) {
+        fprintf(stderr,
+                "[lease] restoration skipped for TID %ld: task exited, identity changed, or ownership changed (%s)\n",
+                (long)lease->tid, reason);
+        lease->active = 0;
+        return;
+    }
+
+    cpu_set_t current_mask;
+    cpu_set_t leased_mask;
+    CPU_ZERO(&current_mask);
+    CPU_ZERO(&leased_mask);
+    CPU_SET(lease->destination_cpu, &leased_mask);
+
+    if (sched_getaffinity(lease->tid, sizeof(current_mask), &current_mask) != 0) {
+        fprintf(stderr,
+                "[lease] restoration failed for TID %ld: sched_getaffinity: %s\n",
+                (long)lease->tid, strerror(errno));
+        return;
+    } else if (!affinity_masks_equal(&current_mask, &leased_mask)) {
+        fprintf(stderr,
+                "[lease] restoration skipped for TID %ld: affinity changed externally (%s)\n",
+                (long)lease->tid, reason);
+        lease->active = 0;
+        return;
+    } else if (sched_setaffinity(lease->tid, sizeof(lease->original_mask),
+                                 &lease->original_mask) != 0) {
+        fprintf(stderr,
+                "[lease] restoration failed for TID %ld: sched_setaffinity: %s\n",
+                (long)lease->tid, strerror(errno));
+        return;
+    } else {
+        fprintf(stderr,
+                "[lease] restored TID %ld original affinity (%s)\n",
+                (long)lease->tid, reason);
+    }
+
+    lease->active = 0;
+}
+
+static void process_affinity_leases(AffinityLease leases[MAX_AFFINITY_LEASES],
+                                    struct timespec now, int restore_all,
+                                    int guardian_fd)
+{
+    for (size_t i = 0; i < MAX_AFFINITY_LEASES; ++i) {
+        if (!leases[i].active)
+            continue;
+        if (restore_all || timespec_diff_seconds(now, leases[i].expires_at) >= 0.0)
+            restore_affinity_lease(&leases[i], restore_all ? "shutdown" : "lease expired");
+
+        if (!leases[i].active && leases[i].guardian_registered &&
+            guardian_fd >= 0) {
+            AffinityLeaseGuardian guardian = {
+                .write_fd = guardian_fd, .ack_fd = -1, .pid = -1
+            };
+            if (affinity_lease_guardian_cancel(&guardian, &leases[i]) == 0) {
+                leases[i].guardian_registered = 0;
+            } else {
+                fprintf(stderr,
+                        "[lease-guardian] could not cancel restored TID %ld: %s\n",
+                        (long)leases[i].tid, strerror(errno));
+            }
+        }
+    }
 }
 
 /* Parse an integer and reject invalid or out-of-range sampling intervals. */
@@ -184,28 +300,8 @@ static int revalidate_candidate(const MigrationCandidate *candidate,
         return -1;
     }
 
-    unsigned long long current_start_ticks = 0;
-
-    if (read_task_start_ticks(candidate->pid, candidate->tid,
-                              &current_start_ticks) != 0)
-        return -1;
-
-    if (current_start_ticks != candidate->start_ticks) {
-        errno = ESRCH;
-        return -1;
-    }
-
-    char task_path[128];
-    int task_path_length = snprintf(
-        task_path, sizeof(task_path), "/proc/%ld/task/%ld",
-        (long)candidate->pid, (long)candidate->tid);
-    struct stat task_info;
-    if (task_path_length < 0 ||
-        (size_t)task_path_length >= sizeof(task_path) ||
-        stat(task_path, &task_info) != 0)
-        return -1;
-    if (task_info.st_uid != geteuid()) {
-        errno = EPERM;
+    if (task_identity_is_owned(candidate->pid, candidate->tid,
+                               candidate->start_ticks) != 1) {
         return -1;
     }
 
@@ -259,12 +355,44 @@ static void record_action_time(
     action_times[MAX_ACTIONS_PER_MINUTE - 1] = now;
 }
 
+static void log_policy_comparison(
+    size_t sample_number, const char *policy_name,
+    CandidateSelectStatus status, const MonitorSnapshot *snapshot,
+    const BenefitCostPolicyConfig *policy_config,
+    const MigrationCandidate *candidate)
+{
+    if (status != CANDIDATE_SELECT_FOUND) {
+        const char *status_text = status == CANDIDATE_SELECT_ERROR
+                                      ? "selector_error" : "no_candidate";
+        fprintf(stderr,
+                "[policy-compare] sample=%zu policy=%s status=%s selector_status=%d\n",
+                sample_number, policy_name, status_text, (int)status);
+        return;
+    }
+
+    BenefitCostResult evaluation;
+    BenefitCostDecision decision = benefit_cost_evaluate(
+        &snapshot->cpu_summary, candidate, policy_config, &evaluation);
+    fprintf(stderr,
+            "[policy-compare] sample=%zu policy=%s status=candidate "
+            "tid=%ld source=%d destination=%d locality=%d "
+            "benefit=%.2fpp cost=%.2fpp score=%.2fpp result=%d\n",
+            sample_number, policy_name, (long)candidate->tid,
+            candidate->source_cpu, candidate->destination_cpu,
+            candidate->locality_score,
+            evaluation.estimated_benefit_percent_points,
+            evaluation.estimated_migration_cost_percent_points,
+            evaluation.score_percent_points, (int)decision);
+}
+
 static void print_usage(const char *program)
 {
-    printf("Usage: %s [--dry-run | --apply] [--interval-ms N]\n",
+    printf("Usage: %s [--dry-run | --apply] [--no-locality | --compare-locality] [--interval-ms N]\n",
            program);
     puts("  --dry-run       Report proposed changes only (default)");
-    puts("  --apply         Pin an approved TID to its destination CPU");
+    puts("  --apply         Apply approved moves as 5-second affinity leases");
+    puts("  --no-locality   Ignore locality cost when scoring (default: enabled)");
+    puts("  --compare-locality Score both policies on the same snapshot (dry-run only)");
     puts("  --interval-ms N Sampling interval, 100..60000 ms (default 1000)");
     puts("  --help          Show this help");
 }
@@ -273,6 +401,8 @@ int main(int argc, char **argv)
 {
     int apply_changes = 0;
     int interval_ms = DEFAULT_INTERVAL_MS;
+    int locality_enabled = 1;
+    int compare_locality = 0;
 
     /* Dry-run is the default so the controller does not alter affinity by accident. */
     for (int i = 1; i < argc; ++i) {
@@ -280,6 +410,10 @@ int main(int argc, char **argv)
             apply_changes = 0;
         } else if (strcmp(argv[i], "--apply") == 0) {
             apply_changes = 1;
+        } else if (strcmp(argv[i], "--no-locality") == 0) {
+            locality_enabled = 0;
+        } else if (strcmp(argv[i], "--compare-locality") == 0) {
+            compare_locality = 1;
         } else if (strcmp(argv[i], "--interval-ms") == 0 &&
                    i + 1 < argc) {
             if (parse_positive_int(argv[++i], &interval_ms) != 0 ||
@@ -299,12 +433,20 @@ int main(int argc, char **argv)
         }
     }
 
+    if (compare_locality && (apply_changes || !locality_enabled)) {
+        fprintf(stderr,
+                "--compare-locality requires dry-run mode and cannot be combined with --no-locality.\n");
+        return 2;
+    }
+
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = handle_signal;
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
+    action.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &action, NULL);
 
     ImbalanceDetector detector;
     ImbalanceDetectorConfig detector_config =
@@ -323,20 +465,27 @@ int main(int argc, char **argv)
         locality_topology_discover(&topology, NULL);
 
     fprintf(stderr,
-            "[startup] mode=%s interval=%dms locality_status=%d "
+            "[startup] mode=%s interval=%dms locality_policy=%s locality_status=%d "
             "discovered_cpus=%zu\n",
             apply_changes ? "APPLY" : "DRY-RUN",
-            interval_ms, (int)locality_status,
+            interval_ms,
+            compare_locality ? "compare" :
+                (locality_enabled ? "enabled" : "disabled"),
+            (int)locality_status,
             topology.discovered_cpu_count);
 
     if (apply_changes) {
         fprintf(stderr,
-                "[warning] --apply pins the selected TID to one CPU. "
-                "Use only on workloads you control.\n");
+                "[warning] --apply temporarily pins an approved TID for %.0f seconds; "
+                "the original mask is restored on expiry or shutdown, with a guardian "
+                "fallback on controller exit.\n",
+                AFFINITY_LEASE_SECONDS);
     }
 
     BenefitCostPolicyConfig cost_config =
         benefit_cost_policy_default_config();
+    if (!locality_enabled)
+        cost_config.locality_cost_percent_points = 0.0;
 
     CandidateSelectorConfig selector_config =
         candidate_selector_default_config();
@@ -345,6 +494,11 @@ int main(int argc, char **argv)
     size_t action_count = 0;
     struct timespec last_action_at = {0, 0};
     int has_last_action = 0;
+    AffinityLease affinity_leases[MAX_AFFINITY_LEASES] = {0};
+    size_t policy_compare_sample = 0;
+    AffinityLeaseGuardian guardian = {
+        .write_fd = -1, .ack_fd = -1, .pid = -1
+    };
 
     MonitorSnapshot previous, current;
     monitor_snapshot_init(&previous);
@@ -363,6 +517,15 @@ int main(int argc, char **argv)
             "[monitor] baseline collected: CPUs=%zu threads=%zu status=%d\n",
             previous.cpu_count, previous.thread_count,
             (int)first_status);
+
+    if (apply_changes && affinity_lease_guardian_start(&guardian) != 0) {
+        perror("could not start affinity lease guardian");
+        monitor_snapshot_destroy(&previous);
+        return 1;
+    }
+    if (apply_changes)
+        fprintf(stderr,
+                "[lease-guardian] active; pending leases will be restored if the controller exits unexpectedly\n");
 
     while (keep_running) {
         struct timespec delay = {
@@ -401,6 +564,16 @@ int main(int argc, char **argv)
                     current.thread_count, (int)monitor_status);
         }
 
+        if (apply_changes) {
+            struct timespec lease_now;
+            if (clock_gettime(CLOCK_MONOTONIC, &lease_now) == 0) {
+                process_affinity_leases(affinity_leases, lease_now, 0,
+                                        guardian.write_fd);
+            } else {
+                perror("clock_gettime for affinity lease");
+            }
+        }
+
         /* The detector filters out brief spikes using persistence and hysteresis. */
         ImbalanceDetectorResult detection =
             imbalance_detector_update(&detector,
@@ -416,6 +589,28 @@ int main(int argc, char **argv)
                 candidate_select_policy_aware(
                     &current, &selector_config, &topology, &cost_config,
                     &candidate, &selector_diagnostics);
+
+            if (compare_locality) {
+                CandidateSelectDiagnostics no_locality_diagnostics;
+                MigrationCandidate no_locality_candidate;
+                memset(&no_locality_candidate, 0,
+                       sizeof(no_locality_candidate));
+                BenefitCostPolicyConfig no_locality_config = cost_config;
+                no_locality_config.locality_cost_percent_points = 0.0;
+                CandidateSelectStatus no_locality_selected =
+                    candidate_select_policy_aware(
+                        &current, &selector_config, &topology,
+                        &no_locality_config, &no_locality_candidate,
+                        &no_locality_diagnostics);
+                ++policy_compare_sample;
+                log_policy_comparison(policy_compare_sample, "locality",
+                                      selected, &current, &cost_config,
+                                      &candidate);
+                log_policy_comparison(policy_compare_sample, "no-locality",
+                                      no_locality_selected, &current,
+                                      &no_locality_config,
+                                      &no_locality_candidate);
+            }
 
             if (selected == CANDIDATE_SELECT_FOUND) {
                 BenefitCostResult evaluation;
@@ -477,39 +672,79 @@ int main(int argc, char **argv)
                                     (long)candidate.tid,
                                     candidate.destination_cpu);
                         } else {
-                            cpu_set_t fresh_allowed;
-
-                            if (revalidate_candidate(&candidate,
-                                                     &fresh_allowed) != 0) {
+                            size_t lease_slot = MAX_AFFINITY_LEASES;
+                            for (size_t i = 0; i < MAX_AFFINITY_LEASES; ++i) {
+                                if (!affinity_leases[i].active) {
+                                    lease_slot = i;
+                                    break;
+                                }
+                            }
+                            if (lease_slot == MAX_AFFINITY_LEASES) {
                                 fprintf(stderr,
-                                        "[action] revalidation rejected TID %ld: %s\n",
-                                        (long)candidate.tid,
-                                        strerror(errno));
+                                        "[action] skipped: no free affinity lease slot\n");
                             } else {
-                                cpu_set_t target;
-                                CPU_ZERO(&target);
-                                CPU_SET(candidate.destination_cpu, &target);
+                                cpu_set_t fresh_allowed;
 
-                                if (sched_setaffinity(candidate.tid,
-                                                      sizeof(target),
-                                                      &target) != 0) {
+                                if (revalidate_candidate(&candidate,
+                                                         &fresh_allowed) != 0) {
                                     fprintf(stderr,
-                                            "[action] sched_setaffinity failed "
-                                            "for TID %ld: %s\n",
+                                            "[action] revalidation rejected TID %ld: %s\n",
                                             (long)candidate.tid,
                                             strerror(errno));
                                 } else {
-                                    last_action_at = now;
-                                    has_last_action = 1;
+                                    cpu_set_t target;
+                                    CPU_ZERO(&target);
+                                    CPU_SET(candidate.destination_cpu, &target);
 
-                                    record_action_time(action_times,
-                                                       &action_count, now);
+                                    AffinityLease pending_lease = {0};
+                                    pending_lease.active = 1;
+                                    pending_lease.pid = candidate.pid;
+                                    pending_lease.tid = candidate.tid;
+                                    pending_lease.start_ticks =
+                                        candidate.start_ticks;
+                                    pending_lease.destination_cpu =
+                                        candidate.destination_cpu;
+                                    pending_lease.original_mask = fresh_allowed;
+                                    pending_lease.expires_at = now;
+                                    pending_lease.expires_at.tv_sec +=
+                                        (time_t)AFFINITY_LEASE_SECONDS;
 
-                                    fprintf(stderr,
-                                            "[action] applied: TID %ld pinned "
-                                            "to CPU %d\n",
-                                            (long)candidate.tid,
-                                            candidate.destination_cpu);
+                                    if (affinity_lease_guardian_register(
+                                            &guardian,
+                                            &pending_lease) != 0) {
+                                        fprintf(stderr,
+                                                "[action] skipped: lease guardian registration failed: %s\n",
+                                                strerror(errno));
+                                    } else if (sched_setaffinity(candidate.tid,
+                                                                 sizeof(target),
+                                                                 &target) != 0) {
+                                        int saved_errno = errno;
+                                        (void)affinity_lease_guardian_cancel(
+                                            &guardian, &pending_lease);
+                                        fprintf(stderr,
+                                                "[action] sched_setaffinity failed "
+                                                "for TID %ld: %s\n",
+                                                (long)candidate.tid,
+                                                strerror(saved_errno));
+                                    } else {
+                                        AffinityLease *lease =
+                                            &affinity_leases[lease_slot];
+                                        *lease = pending_lease;
+                                        lease->guardian_registered = 1;
+
+                                        last_action_at = now;
+                                        has_last_action = 1;
+
+                                        record_action_time(action_times,
+                                                           &action_count, now);
+
+                                        fprintf(stderr,
+                                                "[action] applied: TID %ld leased "
+                                                "to CPU %d for %.0f seconds\n",
+                                                (long)candidate.tid,
+                                                candidate.destination_cpu,
+                                                AFFINITY_LEASE_SECONDS);
+                                    }
                                 }
                             }
                         }
@@ -577,6 +812,34 @@ int main(int argc, char **argv)
 
     monitor_snapshot_destroy(&previous);
     monitor_snapshot_destroy(&current);
+
+    if (apply_changes) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            process_affinity_leases(affinity_leases,
+                                   (struct timespec){0, 0}, 1,
+                                   guardian.write_fd);
+            int leases_remain = 0;
+            for (size_t i = 0; i < MAX_AFFINITY_LEASES; ++i)
+                leases_remain |= affinity_leases[i].active;
+            if (!leases_remain)
+                break;
+
+            struct timespec retry_delay = {0, 50000000L};
+            while (nanosleep(&retry_delay, &retry_delay) != 0 &&
+                   errno == EINTR) {
+            }
+        }
+
+        for (size_t i = 0; i < MAX_AFFINITY_LEASES; ++i) {
+            if (affinity_leases[i].active) {
+                fprintf(stderr,
+                        "[lease] ERROR: TID %ld may remain pinned after shutdown restoration failures\n",
+                        (long)affinity_leases[i].tid);
+            }
+        }
+    }
+
+    affinity_lease_guardian_stop(&guardian);
 
     fprintf(stderr, "[shutdown] controller stopped\n");
     return 0;

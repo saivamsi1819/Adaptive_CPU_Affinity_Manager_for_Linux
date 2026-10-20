@@ -592,6 +592,8 @@ The implementation must:
 - Handle tasks exiting between observation and action.
 - Log failed affinity changes without crashing the controller.
 
+An applied move must be temporary: save the thread's current allowed mask, apply the selected single-CPU mask only for a bounded lease, and restore the saved mask on lease expiry and normal controller shutdown. Restore only when the same owned task still has the lease mask, so an external affinity change is not overwritten. An independent guardian attempts restoration after controller exit, but cannot guarantee recovery if the guardian or whole system also stops; keep apply mode experimental until native Linux validation is complete.
+
 ### 11.2 Dry-Run Mode
 
 The controller must support a mode that performs monitoring, selection, scoring, and logging without changing affinity.
@@ -705,7 +707,7 @@ WSL CPU topology and scheduling behavior may differ from native Linux on the phy
 
 ## 13. Current Implementation Status
 
-Status below reflects the source tree audited and built in WSL on 2026-10-19. The strict build and six test programs passed. Live controller experiments have been run in dry-run mode; no real controller affinity change has been validated.
+Status below reflects the source tree audited and built in WSL through 2026-10-20. The strict build and seven test programs passed. Live controller experiments have been run in dry-run mode; the integrated controller's `--apply` mode still needs the native Linux smoke test.
 
 ### 13.1 Implemented Modules
 
@@ -714,14 +716,14 @@ Status below reflects the source tree audited and built in WSL on 2026-10-19. Th
 - Reads per-CPU counters from `/proc/stat`.
 - Calculates utilization from counter deltas.
 - Reports average, minimum, maximum, and imbalance.
-- A corrected version was reported to compile using `-std=c11 -Wall -Wextra -Wpedantic -O2` in the assistant environment.
+- Builds with strict warnings and completed a short WSL smoke run, sampling all 12 visible CPUs across multiple intervals.
 
 #### `src/process_monitor.c`
 
 - Estimates process CPU usage from `/proc/<PID>/stat`.
 - Handles process names containing spaces or parentheses.
 - Uses process start time to reduce PID-reuse confusion.
-- A corrected version was reported to compile with the same warning flags.
+- Builds with strict warnings and completed a short WSL smoke run, displaying process CPU samples across multiple intervals.
 
 #### `src/affinity_test.c`
 
@@ -738,8 +740,7 @@ Status below reflects the source tree audited and built in WSL on 2026-10-19. Th
 - Tracks PID/TID and task start time to reduce reuse confusion.
 - Handles common exit, race, and invalid-sample cases.
 - Displays the highest CPU-consuming threads.
-- Was reported to compile cleanly and pass a short smoke test in the assistant environment.
-- The standalone monitor's current WSL runtime behavior still needs its own smoke run; the integrated collector was exercised through the controller and monitor-data test.
+- Builds with strict warnings and completed a short WSL smoke run, reporting valid usage samples for visible threads across multiple intervals.
 
 #### `src/monitor_data.h` and `src/monitor_data.c`
 
@@ -773,7 +774,7 @@ The corresponding test files reported were:
 - `tests/locality_policy_test.c`
 - `tests/migration_decision_test.c`
 
-The controlled dry-run workload is in `scripts/dry_run_candidate_experiment.sh`; it uses the already installed `stress-ng` to create source pressure and never enables controller apply mode.
+The controlled dry-run workload is in `scripts/dry_run_candidate_experiment.sh`; it uses the already installed `stress-ng` to create source pressure and never enables controller apply mode. Its optional `no-locality` argument disables the locality cost while retaining base migration cost and minimum-benefit checks. `--compare-locality` scores locality-aware and no-locality selectors against the same snapshot; `scripts/compare_locality_policies.sh [runs]` records candidate status, approvals, and projected benefit/cost for each policy in a timestamped CSV with per-trial logs under the ignored `results/` directory. This isolates policy scoring from between-run scheduling changes, but it does not establish performance improvement. `scripts/repeat_dry_run_experiment.sh` runs the default policy repeatedly. `scripts/measure_controller_overhead.sh` measures repeated dry-run controller CPU use at configurable idle-task counts. `scripts/benchmark_cpu_completion.sh` compares a fixed-work pthread workload under baseline scheduling, static two-CPU affinity, dry-run observation, and temporary adaptive affinity; it records timings, decisions, proposals, applied actions, and restored leases in `results/`. Dry-run measures monitoring overhead only and cannot demonstrate adaptive migration benefit. The project uses stress-ng to generate uneven loads, not as a performance benchmark; the [stress-ng manual](https://github.com/ColinIanKing/stress-ng/blob/master/stress-ng.1) cautions that bogo-op metrics are not reliable throughput measurements.
 
 These modules are integrated by `src/cpu_affinity_manager.c` and the current Makefile.
 
@@ -781,7 +782,7 @@ These modules are integrated by `src/cpu_affinity_manager.c` and the current Mak
 
 The following results were reported during development:
 
-- Monitor-data smoke test (latest run): initial and second status `0`; 12 CPUs, 29 processes, and 42 threads; all 12 CPUs, 29 processes, and 42 threads had valid utilization in the reported snapshot.
+- Monitor-data smoke test (latest run): initial and second status `0`; 12 CPUs, 34 processes, and 54 threads; 12 CPUs, 33 processes, and 53 threads had valid utilization in the reported snapshot.
 - Imbalance-detector test: passed persistence, invalid-sample, hysteresis, cooldown, and configuration-validation cases.
 - Candidate-selector test: passed candidate eligibility, affinity constraints, utilization-threshold, and invalid-sample cases.
 - Benefit-cost-policy test: passed benefit projection, locality penalties, rejection cases, and configuration validation.
@@ -790,17 +791,26 @@ The following results were reported during development:
 
 These locality scores are implementation-specific heuristic outputs. They are not measured cache-miss rates, percentages of performance retained, or proof of a performance benefit.
 
-### 13.4 Validation performed on 2026-10-19
+### 13.4 Validation performed on 2026-10-19 and 2026-10-20
 
 - Strict WSL build of all five Linux programs with `-std=c11 -Wall -Wextra -Wpedantic -Werror -O2`: passed.
-- `make -j2 all test`: all six test programs passed, including monitor sampling, candidate selection, benefit/cost, locality, and end-to-end migration-decision coverage.
+- The fixed-work CPU benchmark compiled with the strict warning flags and `-pthread`; runtime comparison results are recorded below.
+- `make -j2 all test`: all seven test programs passed, including monitor sampling, candidate selection, benefit/cost, locality, end-to-end migration-decision, and guardian recovery coverage.
+- Standalone `cpu_monitor`, `process_monitor`, and `thread_monitor` each completed a short WSL smoke run and printed multiple sampling intervals; these runs only read `/proc`.
 - A deterministic candidate-selector regression rejects a projection whose measured thread utilization exceeds the source CPU's observed utilization.
 - Destination selection now compares each eligible pair with the actual benefit-cost policy and topology-derived locality factor. A regression confirms it selects a same-L1 destination whose lower raw benefit clears the policy, instead of a higher-benefit unknown-locality destination that fails the cost threshold.
 - Locality score now scales the cost penalty: same L1 0.25, same L2 0.50, same L3 0.75, unknown 1.0, and a different locality domain 2.0. A regression verifies both same-L3 approval and different-domain rejection for the same projected benefit.
 - A controlled dry-run produced a candidate on CPUs 0 to 2: estimated thread use 49.9%, projected standard deviation 27.61 to 18.60 percentage points, benefit 9.0 points, modeled cost 8.8 points, score 0.3 points. The controller logged that it would set the affinity and did not apply it.
-- The stress-ng experiment pinned a full-load stressor to CPU 0. In the latest run, the candidate's estimated source was CPU 2 at 17.3% while CPU 0 was at 100%; the selector rejected moving it to the busier CPU with reason `destination_not_lower_than_last_cpu`. Earlier runs also observed the candidate already on the cool CPU or sampled before its affinity mask widened. The result depends on scheduling and sampling timing.
+- The stress-ng experiment pinned a full-load stressor to CPU 0. The user's positive dry-run showed an approved 0->2 proposal (8.8-point estimated benefit, 8.8-point modeled cost, 0.1-point score). Later runs observed the candidate already on CPU 2 at 17.3% or 24.0% while CPU 0 was at 100%; the selector correctly rejected moving it to the busier CPU. The result depends on scheduling and sampling timing.
+- The controller has an opt-in `--no-locality` mode; locality-aware scoring remains the default. This sets the locality cost weight to zero while retaining base migration cost and minimum-benefit checks. The later `--compare-locality` mode scores both selectors against one monitor snapshot in dry-run mode. Five paired WSL trials on 2026-10-20 scored the same candidate and destination in each pair. Locality-aware approved 4/5, while no-locality approved 5/5; mean projected benefit was 8.94 points in both, with modeled costs 8.75 and 5.00 points respectively. This confirms that locality cost changes policy decisions on these samples, not that no-locality improves workload performance. See `results/locality_policy_comparison_20261020T045312Z.csv` and its per-trial logs.
+- The paired comparison runner now evaluates both policies on the same live snapshot in one dry-run controller invocation, avoiding sequential scheduler state differences. The earlier sequential comparison produced three pairs with no scored candidates and one pair in which both policies approved; those runs exposed scheduler movement and are retained only as development records.
+- A three-trial dry-run produced two approved proposals and one rejection because the candidate's estimated source was already cooler than CPU 0; its summary CSV is under the ignored `results/` directory. A later one-trial check confirmed the runner also saves the full log and links it from the CSV. These few trials show that positive proposals can recur, but do not establish repeatability or performance.
+- Three 10-second overhead-harness runs completed in dry-run mode. GNU time measured 0.20%, 0.30%, and 0.30% CPU for the controller command tree, with nine samples per run. This is a preliminary idle-WSL estimate; more runs, workload-size variations, and a baseline comparison are needed before drawing an overhead conclusion.
+- The overhead harness now accepts an idle-task count (`scripts/measure_controller_overhead.sh SECONDS RUNS IDLE_TASKS`) and records it in the CSV. Two 10-second runs each measured 0.50%/0.20% CPU at 0 idle tasks, 0.30%/0.29% at 25 sleeping tasks, and 0.90%/0.70% at 100 sleeping tasks, with nine samples per run. The 100-task runs are higher, but two repetitions per size and WSL noise are too weak to establish a scaling trend; repeat on native Linux before drawing a conclusion.
+- A follow-up overhead series used two 10-second dry-run measurements at 0, 100, and 300 sleeping helper tasks, with nine samples per run. Measured CPU use was 0.10%/0.00%, 0.299%/0.300%, and 0.499%/0.699%, respectively. The increasing values suggest process-count sensitivity, but two runs per size in WSL remain preliminary; repeat with more samples and on native Linux.
+- The fixed-work pthread benchmark completed three repetitions for each of two workloads. With two workers, 500 million base iterations each, and 100% extra work for worker 0, mean completion times were 2.102 s under baseline scheduling, 2.030 s with affinity restricted to CPUs 0–1, and 2.041 s with the controller observing in dry-run. With four workers and 200% extra work for worker 0, the respective means were 3.182 s, 3.987 s, and 3.151 s. Checksums and completed iteration counts matched across each workload's configurations. The dry-run observer made no proposals in either workload; in the four-worker case it logged three policy rejections for insufficient projected benefit. These small WSL samples are preliminary synthetic measurements, not evidence that adaptive migration improves performance.
 - The four-case runtime workload matrix completed in dry-run mode: baseline (no workers), one unrestricted CPU worker, two unrestricted CPU workers, and two workers restricted to one CPU each. The unrestricted-worker cases triggered persistent imbalance, but the best proposals had only 0.0–0.6 percentage points of estimated standard-deviation reduction, below the configured 5-point minimum; the restricted case had no allowed destination. This is evidence of conservative rejection in these scenarios, not evidence of a performance improvement.
-- The affinity tests temporarily restrict their own test process and restore its original mask. The controller was never run in apply mode.
+- The affinity tests temporarily restrict their own test process and restore its original mask. An isolated guardian test also simulates the manager exiting after a temporary affinity change; the guardian restored the test worker's original mask. The integrated controller has not yet been run in apply mode.
 
 These results establish compilation and module-level behavior in this WSL environment. They do not establish that a live workload will produce an approved proposal or that changing affinity improves performance.
 
@@ -808,13 +818,13 @@ These results establish compilation and module-level behavior in this WSL enviro
 
 The following work remains outstanding:
 
-- Repeated, stable dry-run runs across workload variations; the current experiments show that Linux's scheduler can move a candidate before the controller samples it and that common unrestricted-worker cases may not clear the benefit threshold.
-- End-to-end comparisons among baseline scheduling, static affinity, and adaptive control.
-- Systematic measurements of controller overhead and performance effects.
+- Repeated, stable dry-run runs across varied workloads; the same-snapshot comparison removes between-policy timing differences, but broader workloads and more scored candidates are still needed. Some live workload trials have no eligible candidate because the scheduler has already moved the thread before sampling.
+- End-to-end comparisons among baseline scheduling, static affinity, and adaptive control; initial repeated synthetic comparisons exist for baseline, static-mask, and dry-run-overhead cases, but do not measure adaptive performance because controller runs remain dry-run only. Add larger workload variation and repeat on native Linux.
+- Systematic measurements of controller overhead and performance effects; an initial idle-task-count baseline comparison is available, but needs more repetitions, larger task counts, and native Linux measurement. End-to-end performance comparisons still need to be designed and run.
 - Native Linux lab validation, since WSL scheduling and topology may differ.
-- Any actual affinity change. Keep controller runs in dry-run mode until you decide the dry-run policy and action safeguards are ready for that next stage.
+- Repeatable end-to-end measurements that include an adaptive apply case. The benchmark records proposals, applied actions, and normal lease restorations; an apply trial with no action is not evidence of adaptive performance.
 
-The `--apply` path exists but has not been exercised in this validation. Do not report an applied migration or performance improvement based on dry-run or synthetic test results.
+The `--apply` path implements a five-second affinity lease with task identity/owner checks and conditional restoration on expiry or normal shutdown. An independent guardian process registers each lease before the affinity change and retries restoration if the controller exits unexpectedly. The guardian's recovery is covered by an isolated test, but integrated apply behavior still needs the native Linux smoke test below. A guardian crash, whole process-group termination, reboot, or failed OS affinity operation can still prevent recovery; apply mode remains experimental. Do not report an applied migration or performance improvement based on dry-run or synthetic test results.
 
 ---
 
@@ -830,7 +840,30 @@ The WSL system previously reported:
 
 These details describe the reported development environment and should be rechecked when running experiments.
 
-### 14.1 Validation Requirements
+### 14.1 Native Linux Validation Runbook
+
+Run the following from a clean checkout on the institute's native Linux host. First run the isolated live-affinity smoke test once; it only targets its own short-lived test worker, verifies the original mask is restored, and saves a log. If that fails, stop and inspect the log rather than running the adaptive benchmark.
+
+```bash
+make clean
+make -j2 all benchmark test
+bash scripts/lab_apply_smoke_test.sh locality
+```
+
+After the smoke test passes, run the repeatable measurements. The benchmark compares baseline scheduling, static affinity, a dry-run observer, and temporary adaptive affinity; inspect `applied_actions` and `restored_leases` in the CSV before interpreting adaptive timings. Increase iterations if adaptive runs finish before the controller gets a scored sample.
+
+```bash
+bash scripts/benchmark_cpu_completion.sh 2 2000000000 100 5
+bash scripts/benchmark_cpu_completion.sh 4 2000000000 200 5
+bash scripts/measure_controller_overhead.sh 10 5 0
+bash scripts/measure_controller_overhead.sh 10 5 25
+bash scripts/measure_controller_overhead.sh 10 5 100
+bash scripts/repeat_dry_run_experiment.sh 5
+```
+
+The benchmark CSVs and logs are written beneath `results/`, which is ignored by Git; copy the run outputs to the project report or another backed-up location after reviewing them. Record the Linux kernel, CPU model, allowed CPU list, and stress-ng version with the measurements. The smoke test is the one-time apply safety check; performance runs use the benchmark's explicit `adaptive_apply` case and restore affinity on normal shutdown. Treat results as preliminary until repeated measurements across workload sizes are stable and applied/restored actions are confirmed. WSL results do not substitute for this native Linux validation.
+
+### 14.2 Validation Requirements
 
 For every significant module change:
 
@@ -849,7 +882,7 @@ For every significant module change:
 
 Use `-D_GNU_SOURCE` where required for the Linux/GNU interfaces used by the particular source files. Do not suppress warnings as a substitute for resolving genuine correctness problems.
 
-### 14.2 Controlled Changes
+### 14.3 Controlled Changes
 
 Do not rewrite unrelated modules unnecessarily.
 

@@ -3,7 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTROLLER="$ROOT/execute/cpu_affinity_manager"
-INTERVAL_MS=1000
+INTERVAL_MS="${INTERVAL_MS:-250}"
+POLICY="${1:-locality}"
+
+if [[ "$POLICY" != "locality" && "$POLICY" != "no-locality" &&
+      "$POLICY" != "compare" ]]; then
+  echo "Usage: $0 [locality|no-locality|compare]" >&2
+  exit 2
+fi
 
 if [[ ! -x "$CONTROLLER" ]]; then
   echo "Controller binary missing. Run: make -C '$ROOT' all" >&2
@@ -77,9 +84,15 @@ taskset -c "$source_cpu" yes >/dev/null &
 candidate_pid=$!
 sleep 1
 
-# Widen the candidate after two persistence samples and shortly before sample
-# three. Keying off controller output avoids baseline-start timing drift.
-timeout 5s "$CONTROLLER" --dry-run --interval-ms "$INTERVAL_MS" \
+# Widen the candidate immediately after two persistence samples. Keeping the
+# observation window short helps preserve the source CPU as its last CPU.
+controller_args=(--dry-run --interval-ms "$INTERVAL_MS")
+if [[ "$POLICY" == "no-locality" ]]; then
+  controller_args+=(--no-locality)
+elif [[ "$POLICY" == "compare" ]]; then
+  controller_args+=(--compare-locality)
+fi
+"$CONTROLLER" "${controller_args[@]}" \
   >"$log_file" 2>&1 &
 manager_pid=$!
 until grep -q "baseline collected" "$log_file"; do
@@ -98,11 +111,25 @@ while [[ "$(grep -c '^\[sample\]' "$log_file" || true)" -lt 2 ]]; do
   fi
   sleep 0.05
 done
-sleep 0.75
 taskset -pc "$source_cpu,$destination_cpu" "$candidate_pid" >/dev/null
+decision_deadline=$((SECONDS + 5))
+while ! grep -q '^\[decision\]' "$log_file"; do
+  if ! kill -0 "$manager_pid" 2>/dev/null || ((SECONDS >= decision_deadline)); then
+    kill -INT "$manager_pid" 2>/dev/null || true
+    wait "$manager_pid" 2>/dev/null || true
+    manager_pid=""
+    cat "$log_file"
+    echo "Controller did not emit a decision within five seconds." >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+sleep 0.05
+kill -INT "$manager_pid" 2>/dev/null || true
 wait "$manager_pid" || true
+manager_pid=""
 
-printf 'Experiment CPUs: source=%s destination=%s\n' \
-  "$source_cpu" "$destination_cpu"
+printf 'Experiment policy=%s CPUs: source=%s destination=%s\n' \
+  "$POLICY" "$source_cpu" "$destination_cpu"
 cat "$log_file"
 printf '\nThis experiment used --dry-run; no controller affinity action was applied.\n'
